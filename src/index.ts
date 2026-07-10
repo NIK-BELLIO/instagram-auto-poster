@@ -456,14 +456,8 @@ function isPublicUrl(value: string): boolean {
 }
 
 async function hashPassword(password: string, salt: string, pepper: string): Promise<string> {
-  const encoder = new TextEncoder();
-  const key = await crypto.subtle.importKey("raw", encoder.encode(password + pepper), "PBKDF2", false, ["deriveBits"]);
-  const bits = await crypto.subtle.deriveBits(
-    { name: "PBKDF2", hash: "SHA-256", salt: encoder.encode(salt), iterations: 120000 },
-    key,
-    256
-  );
-  return base64Url(new Uint8Array(bits));
+  const bytes = new TextEncoder().encode(`password:v2:${salt}:${password}:${pepper ?? ""}`);
+  return base64Url(new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)));
 }
 
 async function hashSessionToken(token: string, secret: string): Promise<string> {
