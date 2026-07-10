@@ -66,7 +66,10 @@ type CreatePostPayload = {
 
 const JSON_HEADERS = {
   "content-type": "application/json; charset=utf-8",
-  "cache-control": "no-store"
+  "cache-control": "no-store",
+  "access-control-allow-origin": "*",
+  "access-control-allow-methods": "GET,POST,PATCH,DELETE,OPTIONS",
+  "access-control-allow-headers": "content-type,authorization"
 };
 
 export default {
@@ -89,18 +92,21 @@ export default {
 
 async function route(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const url = new URL(request.url);
+  const path = normalizePath(url.pathname);
 
-  if (request.method === "GET" && url.pathname === "/") return html(renderApp());
-  if (request.method === "GET" && url.pathname === "/health") return json({ ok: true, service: "instagram-auto-poster" });
+  if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: JSON_HEADERS });
 
-  if (!url.pathname.startsWith("/api/")) return json({ ok: false, error: "مسیر پیدا نشد." }, 404);
+  if (request.method === "GET" && path === "/") return html(renderApp());
+  if (request.method === "GET" && path === "/health") return json({ ok: true, service: "instagram-auto-poster" });
 
-  if (request.method === "POST" && url.pathname === "/api/auth/register") {
+  if (!path.startsWith("/api/")) return json({ ok: false, error: "مسیر پیدا نشد." }, 404);
+
+  if (request.method === "POST" && path === "/api/auth/register") {
     const payload = await readJson<AuthPayload>(request);
     return json(await registerUser(env, payload), 201);
   }
 
-  if (request.method === "POST" && url.pathname === "/api/auth/login") {
+  if (request.method === "POST" && path === "/api/auth/login") {
     const payload = await readJson<AuthPayload>(request);
     return json(await loginUser(env, payload));
   }
@@ -108,12 +114,12 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
   const auth = await authenticate(request, env);
   if (!auth) return json({ ok: false, error: "اول وارد حساب کاربری شو." }, 401);
 
-  if (request.method === "POST" && url.pathname === "/api/auth/logout") {
+  if (request.method === "POST" && path === "/api/auth/logout") {
     await logout(request, env);
     return json({ ok: true });
   }
 
-  if (request.method === "GET" && url.pathname === "/api/me") {
+  if (request.method === "GET" && path === "/api/me") {
     const ig = await getInstagramAccount(env, auth.id);
     return json({
       ok: true,
@@ -124,7 +130,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     });
   }
 
-  if (request.method === "POST" && url.pathname === "/api/instagram/connect") {
+  if (request.method === "POST" && path === "/api/instagram/connect") {
     const payload = await readJson<ConnectInstagramPayload>(request);
     const igUserId = String(payload.igUserId ?? "").trim();
     const accessToken = String(payload.accessToken ?? "").trim();
@@ -145,7 +151,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     return json({ ok: true, instagram: { connected: true, igUserId } });
   }
 
-  if (request.method === "GET" && url.pathname === "/api/posts") {
+  if (request.method === "GET" && path === "/api/posts") {
     const status = url.searchParams.get("status");
     const result = status
       ? await env.DB.prepare(
@@ -157,7 +163,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     return json({ ok: true, posts: result.results ?? [] });
   }
 
-  if (request.method === "POST" && url.pathname === "/api/posts") {
+  if (request.method === "POST" && path === "/api/posts") {
     const payload = await readJson<CreatePostPayload>(request);
     const post = normalizePostPayload(payload);
     const id = crypto.randomUUID();
@@ -172,7 +178,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     return json({ ok: true, post: await getPost(env, id, auth.id) }, 201);
   }
 
-  const publishNowMatch = url.pathname.match(/^\/api\/posts\/([^/]+)\/publish-now$/);
+  const publishNowMatch = path.match(/^\/api\/posts\/([^/]+)\/publish-now$/);
   if (request.method === "POST" && publishNowMatch) {
     const id = publishNowMatch[1];
     const post = await getPost(env, id, auth.id);
@@ -181,7 +187,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     return json({ ok: true, message: "انتشار شروع شد. چند لحظه بعد وضعیت را تازه‌سازی کن." });
   }
 
-  const postMatch = url.pathname.match(/^\/api\/posts\/([^/]+)$/);
+  const postMatch = path.match(/^\/api\/posts\/([^/]+)$/);
   if (postMatch) {
     const id = postMatch[1];
 
@@ -215,11 +221,17 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     }
   }
 
-  if (request.method === "GET" && url.pathname === "/api/smart/slots") {
+  if (request.method === "GET" && path === "/api/smart/slots") {
     return json({ ok: true, slots: suggestBestSlots() });
   }
 
   return json({ ok: false, error: "درخواست نامعتبر است." }, 404);
+}
+
+function normalizePath(pathname: string): string {
+  if (pathname === "/auto-post") return "/";
+  if (pathname.startsWith("/auto-post/")) return pathname.slice("/auto-post".length) || "/";
+  return pathname;
 }
 
 async function registerUser(env: Env, payload: AuthPayload): Promise<Record<string, unknown>> {
@@ -706,6 +718,7 @@ function renderApp(): string {
     const $ = (id) => document.getElementById(id);
     let token = localStorage.getItem("ig_auto_user_token") || "";
     let filter = "";
+    const apiPrefix = location.pathname.startsWith("/auto-post") ? "/auto-post" : "";
 
     function headers() { return { "content-type": "application/json", "authorization": "Bearer " + token }; }
     function statusText(status) {
@@ -716,7 +729,7 @@ function renderApp(): string {
       return String(value ?? "").replace(/[&<>"']/g, (char) => htmlMap[char] || char);
     }
     async function api(path, options = {}) {
-      const response = await fetch(path, { ...options, headers: { ...headers(), ...(options.headers || {}) } });
+      const response = await fetch(apiPrefix + path, { ...options, headers: { ...headers(), ...(options.headers || {}) } });
       const data = await response.json().catch(() => ({}));
       if (!response.ok || data.ok === false) throw new Error(data.error || "درخواست ناموفق بود.");
       return data;

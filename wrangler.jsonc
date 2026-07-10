@@ -15,10 +15,11 @@
     {
       "binding": "DB",
       "database_name": "instagram-auto-poster",
-      "database_id": "REPLACE_WITH_D1_DATABASE_ID",
+      "database_id": "fd652e07-888d-4260-bbb6-ccdbf1a62750",
       "migrations_dir": "./migrations"
     }
   ],
+  "workers_dev": true,
   "triggers": {
     "crons": ["*/5 * * * *"]
   }
