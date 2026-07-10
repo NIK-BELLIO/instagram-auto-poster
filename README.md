@@ -1,20 +1,31 @@
-# سیستم اتومات پست اینستاگرام
+# Instagram Auto Poster
 
-یک پنل سبک روی Cloudflare Workers برای صف‌کردن، زمان‌بندی و انتشار خودکار پست‌های اینستاگرام با Instagram Graph API رسمی.
+یک پنل چندکاربره روی Cloudflare Workers برای زمان‌بندی و انتشار پست اینستاگرام با مسیر رسمی Instagram Graph API.
 
-## امکانات
+## قابلیت‌ها
 
-- پنل مدیریت فارسی و ساده
+- ثبت‌نام و ورود کاربران
+- هر کاربر پست‌ها و اتصال اینستاگرام خودش را دارد
+- ذخیره Access Token هر کاربر به‌صورت رمزگذاری‌شده با `AUTH_SECRET`
 - ساخت پیش‌نویس یا پست زمان‌بندی‌شده
-- انتشار خودکار هر ۵ دقیقه با Cron
+- انتشار خودکار با Cron هر ۵ دقیقه
 - انتشار فوری
-- ثبت وضعیت‌ها: پیش‌نویس، زمان‌بندی‌شده، منتشرشده، خطادار
-- ثبت تاریخچه اتفاقات هر پست
-- پیشنهاد ساعت‌های مناسب برای انتشار
+- نمایش وضعیت پست‌ها: پیش‌نویس، زمان‌بندی‌شده، منتشرشده، خطادار
+- پیشنهاد ساعت مناسب برای انتشار
+
+## نکته مهم
+
+GitHub فقط محل نگهداری کد است. برای اینکه سیستم واقعاً کار کند باید روی Cloudflare Workers منتشر شود، چون به دیتابیس، Secret و Cron نیاز دارد.
 
 ## پیش‌نیاز اینستاگرام
 
-برای انتشار رسمی باید اکانت اینستاگرام Professional باشد؛ یعنی Business یا Creator، و به یک Facebook Page وصل باشد. سپس در Meta Developer یک App می‌سازی و برای Instagram Graph API توکن رسمی می‌گیری.
+برای انتشار رسمی، هر کاربر باید:
+
+1. اکانت Instagram Professional داشته باشد: Business یا Creator.
+2. اکانت Instagram را به یک Facebook Page وصل کرده باشد.
+3. از Meta Developer مقدارهای رسمی زیر را داشته باشد:
+   - `IG User ID`
+   - `Access Token`
 
 این پروژه پسورد اینستاگرام نمی‌گیرد و با بات مرورگر وارد اکانت نمی‌شود.
 
@@ -26,12 +37,10 @@ copy .dev.vars.example .dev.vars
 npm run dev
 ```
 
-داخل `.dev.vars` این سه مقدار را بگذار:
+داخل `.dev.vars` فقط این مقدار لازم است:
 
 ```env
-ADMIN_TOKEN=رمز_پنل
-IG_USER_ID=instagram_business_account_id
-IG_ACCESS_TOKEN=meta_long_lived_access_token
+AUTH_SECRET=یک_کلید_خیلی_بلند_و_تصادفی_برای_رمزگذاری
 ```
 
 ## ساخت دیتابیس و انتشار روی Cloudflare
@@ -44,10 +53,8 @@ npx wrangler d1 create instagram-auto-poster
 
 ```bash
 npx wrangler d1 migrations apply instagram-auto-poster --remote
-npx wrangler secret put ADMIN_TOKEN
-npx wrangler secret put IG_USER_ID
-npx wrangler secret put IG_ACCESS_TOKEN
+npx wrangler secret put AUTH_SECRET
 npm run deploy
 ```
 
-بعد از بازکردن آدرس Worker، با همان رمز پنل وارد شو و پست‌ها را بساز.
+بعد از بازکردن آدرس Worker، هر نفر می‌تواند ثبت‌نام کند، اتصال اینستاگرام خودش را ذخیره کند و پست‌های خودش را زمان‌بندی کند.
