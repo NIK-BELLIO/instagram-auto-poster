@@ -24,6 +24,19 @@ interface D1Database {
   prepare(query: string): D1PreparedStatement;
 }
 
+interface KVNamespace {
+  get(key: string, options: { type: "stream" }): Promise<ReadableStream | null>;
+  get(key: string): Promise<string | null>;
+  put(
+    key: string,
+    value: ArrayBuffer | ArrayBufferView | ReadableStream | string,
+    options?: {
+      metadata?: Record<string, unknown>;
+      expirationTtl?: number;
+    }
+  ): Promise<void>;
+}
+
 interface ExecutionContext {
   waitUntil(promise: Promise<unknown>): void;
 }

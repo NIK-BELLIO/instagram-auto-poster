@@ -1,5 +1,6 @@
 type Env = {
   DB: D1Database;
+  MEDIA: KVNamespace;
   AUTH_SECRET: string;
   GRAPH_API_VERSION?: string;
 };
@@ -64,6 +65,20 @@ type CreatePostPayload = {
   scheduledAt?: unknown;
 };
 
+type CountRecord = {
+  status: PostStatus;
+  count: number;
+};
+
+const MEDIA_LIMIT_BYTES = 25 * 1024 * 1024;
+const MEDIA_TYPES: Record<string, { extension: string; mediaType: MediaType }> = {
+  "image/jpeg": { extension: "jpg", mediaType: "IMAGE" },
+  "image/png": { extension: "png", mediaType: "IMAGE" },
+  "image/webp": { extension: "webp", mediaType: "IMAGE" },
+  "video/mp4": { extension: "mp4", mediaType: "REELS" },
+  "video/quicktime": { extension: "mov", mediaType: "REELS" }
+};
+
 const JSON_HEADERS = {
   "content-type": "application/json; charset=utf-8",
   "cache-control": "no-store",
@@ -96,6 +111,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
 
   if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: JSON_HEADERS });
 
+  if ((request.method === "GET" || request.method === "HEAD") && path.startsWith("/media/")) return serveMedia(env, path, request.method === "HEAD");
   if (request.method === "GET" && path === "/") return html(renderApp());
   if (request.method === "GET" && path === "/health") return json({ ok: true, service: "instagram-auto-poster" });
 
@@ -128,6 +144,14 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
         ? { connected: true, igUserId: ig.ig_user_id, connectedAt: ig.connected_at }
         : { connected: false }
     });
+  }
+
+  if (request.method === "GET" && path === "/api/stats") {
+    return json(await getUserStats(env, auth.id));
+  }
+
+  if (request.method === "POST" && path === "/api/media/upload") {
+    return json(await uploadMedia(request, env, auth), 201);
   }
 
   if (request.method === "POST" && path === "/api/instagram/connect") {
@@ -226,6 +250,107 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
   }
 
   return json({ ok: false, error: "درخواست نامعتبر است." }, 404);
+}
+
+async function serveMedia(env: Env, path: string, headOnly = false): Promise<Response> {
+  const key = decodeURIComponent(path.slice("/media/".length));
+  if (!key || key.includes("..")) return json({ ok: false, error: "Invalid media key." }, 400);
+  const [body, metadataRaw] = await Promise.all([
+    env.MEDIA.get(key, { type: "stream" }),
+    env.MEDIA.get(`${key}:meta`)
+  ]);
+  if (!body) return json({ ok: false, error: "Media not found." }, 404);
+
+  const metadata = parseMediaMetadata(metadataRaw);
+  return new Response(headOnly ? null : body, {
+    headers: {
+      "content-type": metadata.contentType,
+      "content-disposition": `inline; filename="${metadata.name.replace(/"/g, "")}"`,
+      "cache-control": "public, max-age=31536000, immutable",
+      "x-content-type-options": "nosniff"
+    }
+  });
+}
+
+function parseMediaMetadata(value: string | null): { contentType: string; name: string } {
+  if (!value) return { contentType: "application/octet-stream", name: "media" };
+  try {
+    const parsed = JSON.parse(value) as { contentType?: unknown; name?: unknown };
+    return {
+      contentType: typeof parsed.contentType === "string" ? parsed.contentType : "application/octet-stream",
+      name: typeof parsed.name === "string" ? parsed.name : "media"
+    };
+  } catch {
+    return { contentType: "application/octet-stream", name: "media" };
+  }
+}
+
+function mediaUrlFromKey(origin: string, key: string): string {
+  return `${origin}/media/${encodeURIComponent(key).replace(/%2F/g, "/")}`;
+}
+
+function safeOriginalName(name: string): string {
+  return name.replace(/[^\w.\- ]+/g, "").trim().slice(0, 120) || "media";
+}
+
+async function uploadMedia(request: Request, env: Env, user: UserRecord): Promise<Record<string, unknown>> {
+  const form = await request.formData();
+  const rawFile = form.get("file");
+  if (!(rawFile instanceof File)) throw new HttpError("Upload a media file first.", 400);
+
+  const contentType = rawFile.type || "application/octet-stream";
+  const media = MEDIA_TYPES[contentType];
+  if (!media) throw new HttpError("Only JPG, PNG, WEBP, MP4, or MOV files are supported.", 400);
+  if (rawFile.size <= 0) throw new HttpError("The uploaded file is empty.", 400);
+  if (rawFile.size > MEDIA_LIMIT_BYTES) throw new HttpError("Media file is too large. Maximum size is 25 MB.", 413);
+
+  const key = `${user.id}/${crypto.randomUUID()}.${media.extension}`;
+  const body = await rawFile.arrayBuffer();
+  const name = safeOriginalName(rawFile.name);
+  await Promise.all([
+    env.MEDIA.put(key, body),
+    env.MEDIA.put(`${key}:meta`, JSON.stringify({ contentType, name, size: rawFile.size, userId: user.id }))
+  ]);
+
+  const url = new URL(request.url);
+  return {
+    ok: true,
+    media: {
+      url: mediaUrlFromKey(url.origin, key),
+      type: media.mediaType,
+      contentType,
+      size: rawFile.size,
+      name
+    }
+  };
+}
+
+async function getUserStats(env: Env, userId: string): Promise<Record<string, unknown>> {
+  const grouped = await env.DB.prepare(
+    "SELECT status, COUNT(*) AS count FROM posts WHERE user_id = ? GROUP BY status"
+  ).bind(userId).all<CountRecord>();
+  const counts: Record<string, number> = {
+    draft: 0,
+    scheduled: 0,
+    publishing: 0,
+    published: 0,
+    failed: 0,
+    cancelled: 0
+  };
+  for (const row of grouped.results ?? []) counts[row.status] = Number(row.count) || 0;
+  const total = Object.values(counts).reduce((sum, count) => sum + count, 0);
+  const ig = await getInstagramAccount(env, userId);
+  return {
+    ok: true,
+    stats: {
+      totalPosts: total,
+      scheduledPosts: counts.scheduled,
+      publishedPosts: counts.published,
+      failedPosts: counts.failed,
+      instagramConnected: Boolean(ig),
+      mediaUploadEnabled: true
+    }
+  };
 }
 
 function normalizePath(pathname: string): string {

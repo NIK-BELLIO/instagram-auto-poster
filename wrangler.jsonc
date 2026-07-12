@@ -19,6 +19,12 @@
       "migrations_dir": "./migrations"
     }
   ],
+  "kv_namespaces": [
+    {
+      "binding": "MEDIA",
+      "id": "4b882010ffe94c0597d004fb475a30db"
+    }
+  ],
   "workers_dev": true,
   "triggers": {
     "crons": ["*/5 * * * *"]
