@@ -246,7 +246,14 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
   }
 
   if (request.method === "GET" && path === "/api/smart/slots") {
-    return json({ ok: true, slots: suggestBestSlots() });
+    return json({
+      ok: true,
+      slots: suggestBestSlots({
+        timeZone: url.searchParams.get("tz") || "UTC",
+        mediaType: url.searchParams.get("mediaType") || "IMAGE",
+        caption: url.searchParams.get("caption") || ""
+      })
+    });
   }
 
   return json({ ok: false, error: "درخواست نامعتبر است." }, 404);
@@ -702,30 +709,127 @@ function extractGraphError(payload: Record<string, unknown>, fallback: string): 
   return fallback;
 }
 
-function suggestBestSlots(): Array<{ label: string; value: string; reason: string }> {
-  const slots: Array<{ label: string; value: string; reason: string }> = [];
+function suggestBestSlots(options: { timeZone: string; mediaType: string; caption: string }): Array<{ label: string; value: string; reason: string; score: number }> {
+  const timeZone = normalizeTimeZone(options.timeZone);
+  const mediaType = String(options.mediaType || "IMAGE").toUpperCase();
+  const caption = String(options.caption || "").toLowerCase();
   const now = new Date();
-  const preferredHours = [12, 18, 21];
+  const candidates: Array<{ date: Date; hour: number; dayOffset: number; score: number; reason: string }> = [];
+  const candidateHours = [7, 8, 9, 11, 12, 13, 17, 18, 19, 20, 21, 22];
 
-  for (let dayOffset = 0; slots.length < 9 && dayOffset < 7; dayOffset += 1) {
-    for (const hour of preferredHours) {
-      const date = new Date(now);
-      date.setDate(now.getDate() + dayOffset);
-      date.setHours(hour, 0, 0, 0);
-      if (date.getTime() <= now.getTime() + 30 * 60 * 1000) continue;
-      slots.push({
-        label: date.toLocaleString("fa-IR", { weekday: "long", hour: "2-digit", minute: "2-digit" }),
-        value: date.toISOString().slice(0, 16),
-        reason: hour === 21
-          ? "برای محتوای سرگرمی و سبک معمولاً بهتر جواب می‌دهد."
-          : hour === 18
-            ? "بعد از کار/دانشگاه، احتمال دیده‌شدن بالاتر است."
-            : "برای محتوای آموزشی و محصولی مناسب است."
-      });
+  for (let dayOffset = 0; dayOffset < 14; dayOffset += 1) {
+    for (const hour of candidateHours) {
+      const date = buildLocalSlot(now, dayOffset, hour);
+      if (date.getTime() <= now.getTime() + 45 * 60 * 1000) continue;
+      const profile = scorePublishingSlot({ date, hour, dayOffset, mediaType, caption });
+      candidates.push({ date, hour, dayOffset, score: profile.score, reason: profile.reason });
     }
   }
 
-  return slots;
+  return candidates
+    .sort((a, b) => b.score - a.score || a.date.getTime() - b.date.getTime())
+    .slice(0, 9)
+    .map((slot) => ({
+      label: formatSlotLabel(slot.date, timeZone),
+      value: formatSlotInputValue(slot.date, timeZone),
+      reason: slot.reason,
+      score: slot.score
+    }));
+}
+
+function buildLocalSlot(now: Date, dayOffset: number, hour: number): Date {
+  const date = new Date(now);
+  date.setDate(now.getDate() + dayOffset);
+  date.setHours(hour, 0, 0, 0);
+  return date;
+}
+
+function scorePublishingSlot(input: { date: Date; hour: number; dayOffset: number; mediaType: string; caption: string }): { score: number; reason: string } {
+  const day = input.date.getDay();
+  const isWeekend = day === 0 || day === 6;
+  const isReels = input.mediaType === "REELS";
+  let score = 44;
+  const reasons: string[] = [];
+
+  if ([18, 19, 20, 21].includes(input.hour)) {
+    score += isReels ? 28 : 22;
+    reasons.push("strong evening engagement window");
+  } else if ([11, 12, 13].includes(input.hour)) {
+    score += 15;
+    reasons.push("good lunch-break discovery window");
+  } else if ([8, 9].includes(input.hour)) {
+    score += 10;
+    reasons.push("morning check-in audience activity");
+  } else {
+    score += 4;
+    reasons.push("secondary audience window");
+  }
+
+  if (isWeekend && [11, 12, 20, 21].includes(input.hour)) {
+    score += 9;
+    reasons.push("weekend browsing behavior");
+  }
+  if (!isWeekend && [18, 19, 20].includes(input.hour)) {
+    score += 8;
+    reasons.push("after-work activity");
+  }
+  if (input.dayOffset === 0) score -= 8;
+  if (input.dayOffset >= 1 && input.dayOffset <= 4) score += 5 - input.dayOffset;
+  if (input.dayOffset >= 5) score -= 2;
+  if (day === 2 || day === 3 || day === 4) score += 3;
+  if (day === 1) score += 1;
+
+  if (/\b(sale|offer|launch|product|shop|buy|discount)\b/.test(input.caption) && [11, 12, 18, 19].includes(input.hour)) {
+    score += 8;
+    reasons.push("commerce content timing");
+  }
+  if (/\b(tutorial|guide|learn|tips|how to|education)\b/.test(input.caption) && [8, 9, 12].includes(input.hour)) {
+    score += 8;
+    reasons.push("educational content timing");
+  }
+  if (/\b(fun|meme|story|behind|reel|vlog)\b/.test(input.caption) && [20, 21, 22].includes(input.hour)) {
+    score += 8;
+    reasons.push("entertainment content timing");
+  }
+
+  return {
+    score: Math.max(1, Math.min(100, score)),
+    reason: `${reasons.slice(0, 2).join(" + ")}. Predicted score: ${Math.max(1, Math.min(100, score))}/100.`
+  };
+}
+
+function formatSlotLabel(date: Date, timeZone: string): string {
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit"
+  }).format(date);
+}
+
+function formatSlotInputValue(date: Date, timeZone: string): string {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false
+  }).formatToParts(date);
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${values.year}-${values.month}-${values.day}T${values.hour}:${values.minute}`;
+}
+
+function normalizeTimeZone(value: string): string {
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: value }).format(new Date());
+    return value;
+  } catch {
+    return "UTC";
+  }
 }
 
 function renderApp(): string {
@@ -953,8 +1057,13 @@ function renderApp(): string {
     });
     document.querySelectorAll("[data-filter]").forEach((button) => button.addEventListener("click", () => { filter = button.dataset.filter; loadPosts(); }));
     $("slotsBtn").addEventListener("click", async () => {
-      const data = await api("/api/smart/slots");
-      $("slots").innerHTML = data.slots.map((slot) => \`<div class="slot"><button class="secondary" onclick="scheduledAt.value='\${slot.value}';slotsDialog.close()">\${escapeHtml(slot.label)}</button><small>\${escapeHtml(slot.reason)}</small></div>\`).join("");
+      const params = new URLSearchParams({
+        tz: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
+        mediaType: $("mediaType").value,
+        caption: $("caption").value.slice(0, 500)
+      });
+      const data = await api("/api/smart/slots?" + params.toString());
+      $("slots").innerHTML = data.slots.map((slot) => \`<div class="slot"><button class="secondary" onclick="scheduledAt.value='\${slot.value}';slotsDialog.close()">\${escapeHtml(slot.label)} · \${escapeHtml(String(slot.score || ""))}/100</button><small>\${escapeHtml(slot.reason)}</small></div>\`).join("");
       slotsDialog.showModal();
     });
     loadMe();
