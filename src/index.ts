@@ -517,22 +517,21 @@ function getInstagramRedirectUri(env: Env): string {
 }
 
 async function getInstagramAppConfig(env: Env): Promise<{ clientId: string; clientSecret: string; redirectUri: string }> {
-  const [dbClientId, dbClientSecret, dbRedirectUri] = await Promise.all([
+  const [dbClientId, dbClientSecret] = await Promise.all([
     getAppSetting(env, "INSTAGRAM_CLIENT_ID"),
-    getAppSetting(env, "INSTAGRAM_CLIENT_SECRET"),
-    getAppSetting(env, "INSTAGRAM_REDIRECT_URI")
+    getAppSetting(env, "INSTAGRAM_CLIENT_SECRET")
   ]);
   return {
     clientId: dbClientId || env.INSTAGRAM_CLIENT_ID?.trim() || "",
     clientSecret: dbClientSecret || env.INSTAGRAM_CLIENT_SECRET?.trim() || "",
-    redirectUri: dbRedirectUri || getInstagramRedirectUri(env)
+    redirectUri: getInstagramRedirectUri(env)
   };
 }
 
 async function saveInstagramAppConfig(env: Env, payload: InstagramAppPayload): Promise<void> {
   const clientId = String(payload.clientId ?? "").trim();
   const clientSecret = String(payload.clientSecret ?? "").trim();
-  const redirectUri = String(payload.redirectUri ?? getInstagramRedirectUri(env)).trim();
+  const redirectUri = getInstagramRedirectUri(env);
   if (!clientId || clientId.length < 4) throw new HttpError("Client ID is required.", 400);
   if (!clientSecret || clientSecret.length < 8) throw new HttpError("Client Secret is required.", 400);
   if (!/^https:\/\//i.test(redirectUri)) throw new HttpError("Redirect URI must be HTTPS.", 400);
