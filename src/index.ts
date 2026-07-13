@@ -268,6 +268,9 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
   }
 
   if (request.method === "POST" && path === "/api/posts") {
+    if (!(await hasPublishingConnection(env, auth.id))) {
+      throw new HttpError("Connect Instagram first to schedule and publish posts.", 403);
+    }
     const payload = await readJson<CreatePostPayload>(request);
     const post = normalizePostPayload(payload);
     const id = crypto.randomUUID();
@@ -775,6 +778,14 @@ async function publishToInstagram(
 
 async function getInstagramAccount(env: Env, userId: string): Promise<InstagramAccountRecord | null> {
   return await env.DB.prepare("SELECT * FROM instagram_accounts WHERE user_id = ?").bind(userId).first<InstagramAccountRecord>();
+}
+
+async function hasPublishingConnection(env: Env, userId: string): Promise<boolean> {
+  const [instagram, publisher] = await Promise.all([
+    getInstagramAccount(env, userId),
+    getExternalPublisher(env, userId)
+  ]);
+  return Boolean(instagram || publisher);
 }
 
 async function getExternalPublisher(env: Env, userId: string): Promise<ExternalPublisherRecord | null> {
