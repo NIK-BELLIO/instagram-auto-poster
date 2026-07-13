@@ -77,6 +77,12 @@ type ConnectPublisherPayload = {
   secret?: unknown;
 };
 
+type InstagramAppPayload = {
+  clientId?: unknown;
+  clientSecret?: unknown;
+  redirectUri?: unknown;
+};
+
 type CreatePostPayload = {
   caption?: unknown;
   mediaUrl?: unknown;
@@ -179,6 +185,13 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
 
   if (request.method === "POST" && path === "/api/media/upload") {
     return json(await uploadMedia(request, env, auth), 201);
+  }
+
+  if (request.method === "POST" && path === "/api/admin/instagram-app") {
+    if (auth.role !== "admin") throw new HttpError("Only the site owner can change Instagram app settings.", 403);
+    const payload = await readJson<InstagramAppPayload>(request);
+    await saveInstagramAppConfig(env, payload);
+    return json({ ok: true, message: "Instagram app settings saved. Direct connect is now active." });
   }
 
   if (request.method === "GET" && path === "/api/instagram/oauth/start") {
@@ -445,15 +458,14 @@ async function getUserStats(env: Env, userId: string): Promise<Record<string, un
 }
 
 async function buildInstagramOAuthUrl(env: Env, userId: string): Promise<string> {
-  const clientId = env.INSTAGRAM_CLIENT_ID?.trim();
-  const redirectUri = getInstagramRedirectUri(env);
-  if (!clientId || !env.INSTAGRAM_CLIENT_SECRET?.trim()) {
-    throw new HttpError("Instagram direct connect is not configured yet. The AI Radar owner must set INSTAGRAM_CLIENT_ID and INSTAGRAM_CLIENT_SECRET once.", 503);
+  const config = await getInstagramAppConfig(env);
+  if (!config.clientId || !config.clientSecret) {
+    throw new HttpError("Direct Instagram connection is not active yet. The site owner needs to finish one-time Instagram app setup.", 503);
   }
   const state = await createInstagramOAuthState(env, userId);
   const oauth = new URL("https://www.instagram.com/oauth/authorize");
-  oauth.searchParams.set("client_id", clientId);
-  oauth.searchParams.set("redirect_uri", redirectUri);
+  oauth.searchParams.set("client_id", config.clientId);
+  oauth.searchParams.set("redirect_uri", config.redirectUri);
   oauth.searchParams.set("response_type", "code");
   oauth.searchParams.set("scope", "instagram_business_basic,instagram_business_content_publish");
   oauth.searchParams.set("state", state);
@@ -499,16 +511,65 @@ function getInstagramRedirectUri(env: Env): string {
   return env.INSTAGRAM_REDIRECT_URI?.trim() || "https://instagram-auto-poster.aliniashyn-9b4.workers.dev/api/instagram/oauth/callback";
 }
 
+async function getInstagramAppConfig(env: Env): Promise<{ clientId: string; clientSecret: string; redirectUri: string }> {
+  const [dbClientId, dbClientSecret, dbRedirectUri] = await Promise.all([
+    getAppSetting(env, "INSTAGRAM_CLIENT_ID"),
+    getAppSetting(env, "INSTAGRAM_CLIENT_SECRET"),
+    getAppSetting(env, "INSTAGRAM_REDIRECT_URI")
+  ]);
+  return {
+    clientId: dbClientId || env.INSTAGRAM_CLIENT_ID?.trim() || "",
+    clientSecret: dbClientSecret || env.INSTAGRAM_CLIENT_SECRET?.trim() || "",
+    redirectUri: dbRedirectUri || getInstagramRedirectUri(env)
+  };
+}
+
+async function saveInstagramAppConfig(env: Env, payload: InstagramAppPayload): Promise<void> {
+  const clientId = String(payload.clientId ?? "").trim();
+  const clientSecret = String(payload.clientSecret ?? "").trim();
+  const redirectUri = String(payload.redirectUri ?? getInstagramRedirectUri(env)).trim();
+  if (!clientId || clientId.length < 4) throw new HttpError("Client ID is required.", 400);
+  if (!clientSecret || clientSecret.length < 8) throw new HttpError("Client Secret is required.", 400);
+  if (!/^https:\/\//i.test(redirectUri)) throw new HttpError("Redirect URI must be HTTPS.", 400);
+  await Promise.all([
+    setAppSetting(env, "INSTAGRAM_CLIENT_ID", clientId),
+    setAppSetting(env, "INSTAGRAM_CLIENT_SECRET", clientSecret),
+    setAppSetting(env, "INSTAGRAM_REDIRECT_URI", redirectUri)
+  ]);
+}
+
+async function getAppSetting(env: Env, key: string): Promise<string> {
+  try {
+    const row = await env.DB.prepare("SELECT value_cipher, value_iv FROM app_settings WHERE key = ?").bind(key).first<{ value_cipher: string; value_iv: string }>();
+    return row ? await decryptSecret(env, row.value_cipher, row.value_iv) : "";
+  } catch {
+    return "";
+  }
+}
+
+async function setAppSetting(env: Env, key: string, value: string): Promise<void> {
+  const encrypted = await encryptSecret(env, value);
+  await env.DB.prepare(
+    `INSERT INTO app_settings (key, value_cipher, value_iv, updated_at)
+     VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+     ON CONFLICT(key) DO UPDATE SET
+       value_cipher = excluded.value_cipher,
+       value_iv = excluded.value_iv,
+       updated_at = CURRENT_TIMESTAMP`
+  ).bind(key, encrypted.cipher, encrypted.iv).run();
+}
+
 async function exchangeInstagramCode(env: Env, code: string): Promise<{ accessToken: string; userId: string }> {
-  const clientId = env.INSTAGRAM_CLIENT_ID?.trim();
-  const clientSecret = env.INSTAGRAM_CLIENT_SECRET?.trim();
-  if (!clientId || !clientSecret) throw new HttpError("Instagram direct connect is not configured yet.", 503);
+  const config = await getInstagramAppConfig(env);
+  const clientId = config.clientId;
+  const clientSecret = config.clientSecret;
+  if (!clientId || !clientSecret) throw new HttpError("Direct Instagram connection is not active yet.", 503);
 
   const body = new URLSearchParams();
   body.set("client_id", clientId);
   body.set("client_secret", clientSecret);
   body.set("grant_type", "authorization_code");
-  body.set("redirect_uri", getInstagramRedirectUri(env));
+  body.set("redirect_uri", config.redirectUri);
   body.set("code", code);
 
   const response = await fetch("https://api.instagram.com/oauth/access_token", { method: "POST", body });
