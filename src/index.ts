@@ -7,6 +7,9 @@ type Env = {
   INSTAGRAM_CLIENT_SECRET?: string;
   INSTAGRAM_REDIRECT_URI?: string;
   APP_URL?: string;
+  AYRSHARE_API_KEY?: string;
+  AYRSHARE_PRIVATE_KEY?: string;
+  AYRSHARE_DOMAIN?: string;
 };
 
 type PostStatus = "draft" | "scheduled" | "publishing" | "published" | "failed" | "cancelled";
@@ -43,6 +46,17 @@ type ExternalPublisherRecord = {
   secret_cipher: string | null;
   secret_iv: string | null;
   connected_at: string;
+};
+
+type ProviderAccountRecord = {
+  user_id: string;
+  provider: "ayrshare";
+  profile_key_cipher: string;
+  profile_key_iv: string;
+  ref_id: string | null;
+  title: string | null;
+  connected_at: string;
+  updated_at: string;
 };
 
 type PostRecord = {
@@ -166,8 +180,14 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
 
   if (request.method === "GET" && path === "/api/me") {
     const ig = await getInstagramAccount(env, auth.id);
-    const publisher = await getExternalPublisher(env, auth.id);
+    const [publisher, providerAccount] = await Promise.all([
+      getExternalPublisher(env, auth.id),
+      getProviderAccount(env, auth.id)
+    ]);
     const instagramApp = await getInstagramAppConfig(env);
+    const providerStatus = providerAccount
+      ? await getAyrshareStatus(env, providerAccount).catch(() => ({ connected: false, provider: "ayrshare", needsLink: true }))
+      : { connected: false, provider: "ayrshare", configured: isAyrshareConfigured(env) };
     return json({
       ok: true,
       user: publicUser(auth),
@@ -177,7 +197,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       instagramDirect: { configured: isUsableInstagramAppConfig(instagramApp) },
       publisher: publisher
         ? { connected: true, provider: publisher.provider, connectedAt: publisher.connected_at }
-        : { connected: false }
+        : providerStatus
     });
   }
 
@@ -197,6 +217,13 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
   }
 
   if (request.method === "GET" && path === "/api/instagram/oauth/start") {
+    return json({ ok: true, url: await buildInstagramOAuthUrl(env, auth.id) });
+  }
+
+  if (request.method === "GET" && path === "/api/provider/connect/start") {
+    if (isAyrshareConfigured(env)) {
+      return json({ ok: true, provider: "ayrshare", url: await buildAyrshareConnectUrl(env, auth) });
+    }
     return json({ ok: true, url: await buildInstagramOAuthUrl(env, auth.id) });
   }
 
@@ -703,6 +730,11 @@ async function publishPost(env: Env, postId: string): Promise<void> {
       await publishToWebhook(env, post, publisher);
       return;
     }
+    const providerAccount = await getProviderAccount(env, post.user_id);
+    if (providerAccount) {
+      await publishToAyrshare(env, post, providerAccount);
+      return;
+    }
     const message = "Manual publishing mode: Meta connection is not active. Open Instagram, copy the caption, and use the uploaded media from AI Radar.";
     await env.DB.prepare(
       "UPDATE posts SET last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?"
@@ -784,15 +816,144 @@ async function getInstagramAccount(env: Env, userId: string): Promise<InstagramA
 }
 
 async function hasPublishingConnection(env: Env, userId: string): Promise<boolean> {
-  const [instagram, publisher] = await Promise.all([
+  const [instagram, publisher, providerAccount] = await Promise.all([
     getInstagramAccount(env, userId),
-    getExternalPublisher(env, userId)
+    getExternalPublisher(env, userId),
+    getProviderAccount(env, userId)
   ]);
-  return Boolean(instagram || publisher);
+  return Boolean(instagram || publisher || providerAccount);
 }
 
 async function getExternalPublisher(env: Env, userId: string): Promise<ExternalPublisherRecord | null> {
   return await env.DB.prepare("SELECT * FROM external_publishers WHERE user_id = ?").bind(userId).first<ExternalPublisherRecord>();
+}
+
+function isAyrshareConfigured(env: Env): boolean {
+  return Boolean(env.AYRSHARE_API_KEY?.trim() && env.AYRSHARE_PRIVATE_KEY?.trim() && env.AYRSHARE_DOMAIN?.trim());
+}
+
+async function getProviderAccount(env: Env, userId: string): Promise<ProviderAccountRecord | null> {
+  return await env.DB.prepare("SELECT * FROM provider_accounts WHERE user_id = ? AND provider = 'ayrshare'").bind(userId).first<ProviderAccountRecord>();
+}
+
+async function ensureAyrshareAccount(env: Env, user: UserRecord): Promise<ProviderAccountRecord> {
+  const existing = await getProviderAccount(env, user.id);
+  if (existing) return existing;
+  const apiKey = env.AYRSHARE_API_KEY?.trim();
+  if (!apiKey) throw new HttpError("Instagram provider is not active yet.", 503);
+  const title = `AI Radar ${user.email}`;
+  const response = await fetch("https://api.ayrshare.com/api/profiles", {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
+    body: JSON.stringify({
+      title,
+      hideTopHeader: true,
+      subHeader: "Connect Instagram to schedule posts from AI Radar",
+      disableSocial: ["bluesky", "facebook", "gmb", "linkedin", "pinterest", "reddit", "snapchat", "telegram", "threads", "tiktok", "twitter", "youtube"]
+    })
+  });
+  const body = await safeJson(response);
+  if (!response.ok || typeof body.profileKey !== "string") {
+    throw new HttpError(extractGraphError(body, "Could not create Instagram publishing profile."), response.status || 502);
+  }
+  const encrypted = await encryptSecret(env, body.profileKey);
+  await env.DB.prepare(
+    `INSERT INTO provider_accounts (user_id, provider, profile_key_cipher, profile_key_iv, ref_id, title, connected_at, updated_at)
+     VALUES (?, 'ayrshare', ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+     ON CONFLICT(user_id, provider) DO UPDATE SET
+       profile_key_cipher = excluded.profile_key_cipher,
+       profile_key_iv = excluded.profile_key_iv,
+       ref_id = excluded.ref_id,
+       title = excluded.title,
+       updated_at = CURRENT_TIMESTAMP`
+  ).bind(user.id, encrypted.cipher, encrypted.iv, typeof body.refId === "string" ? body.refId : null, typeof body.title === "string" ? body.title : title).run();
+  const created = await getProviderAccount(env, user.id);
+  if (!created) throw new HttpError("Could not save Instagram publishing profile.", 500);
+  return created;
+}
+
+async function buildAyrshareConnectUrl(env: Env, user: UserRecord): Promise<string> {
+  const apiKey = env.AYRSHARE_API_KEY?.trim();
+  const privateKey = env.AYRSHARE_PRIVATE_KEY?.trim();
+  const domain = env.AYRSHARE_DOMAIN?.trim();
+  if (!apiKey || !privateKey || !domain) throw new HttpError("Instagram provider is not active yet.", 503);
+  const account = await ensureAyrshareAccount(env, user);
+  const profileKey = await decryptSecret(env, account.profile_key_cipher, account.profile_key_iv);
+  const appUrl = env.APP_URL?.trim() || "https://airadar.me/auto-post/";
+  const redirect = new URL(appUrl);
+  redirect.searchParams.set("provider", "connected");
+  const response = await fetch("https://api.ayrshare.com/api/profiles/generateJWT", {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
+    body: JSON.stringify({
+      domain,
+      privateKey,
+      profileKey,
+      allowedSocial: ["instagram"],
+      instagramLinkMethod: "instagram",
+      redirect: redirect.toString(),
+      expiresIn: 30
+    })
+  });
+  const body = await safeJson(response);
+  if (!response.ok || typeof body.url !== "string") {
+    throw new HttpError(extractGraphError(body, "Could not open Instagram connection page."), response.status || 502);
+  }
+  return body.url;
+}
+
+async function getAyrshareStatus(env: Env, account: ProviderAccountRecord): Promise<Record<string, unknown>> {
+  if (!isAyrshareConfigured(env)) return { connected: false, provider: "ayrshare", configured: false };
+  const apiKey = env.AYRSHARE_API_KEY?.trim() || "";
+  const profileKey = await decryptSecret(env, account.profile_key_cipher, account.profile_key_iv);
+  const response = await fetch("https://api.ayrshare.com/api/user?instagramDetails=true", {
+    headers: { authorization: `Bearer ${apiKey}`, "profile-key": profileKey }
+  });
+  const body = await safeJson(response);
+  if (!response.ok) return { connected: false, provider: "ayrshare", configured: true, needsLink: true };
+  const active = Array.isArray(body.activeSocialAccounts) ? body.activeSocialAccounts : [];
+  const connected = active.includes("instagram");
+  const profiles = Array.isArray(body.socialProfiles) ? body.socialProfiles : [];
+  const instagram = profiles.find((profile: Record<string, unknown>) => profile.platform === "instagram") || null;
+  return { connected, provider: "ayrshare", connectedAt: account.connected_at, needsLink: !connected, instagram };
+}
+
+async function publishToAyrshare(env: Env, post: PostRecord, account: ProviderAccountRecord): Promise<void> {
+  await env.DB.prepare("UPDATE posts SET status = 'publishing', last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(post.id).run();
+  await addEvent(env, post.id, "ayrshare_publishing", "Sending post to Ayrshare Instagram publisher.");
+  try {
+    const apiKey = env.AYRSHARE_API_KEY?.trim();
+    if (!apiKey) throw new Error("Ayrshare provider is not active.");
+    const profileKey = await decryptSecret(env, account.profile_key_cipher, account.profile_key_iv);
+    const response = await fetch("https://api.ayrshare.com/api/post", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}`, "profile-key": profileKey },
+      body: JSON.stringify({
+        post: post.caption,
+        platforms: ["instagram"],
+        mediaUrls: [post.media_url],
+        isVideo: post.media_type === "REELS",
+        idempotencyKey: post.id
+      })
+    });
+    const body = await safeJson(response);
+    if (!response.ok || body.status === "error") throw new Error(extractGraphError(body, "Ayrshare Instagram publish failed."));
+    const providerId = typeof body.id === "string" ? body.id : `ayrshare:${Date.now()}`;
+    await env.DB.prepare(
+      `UPDATE posts
+       SET status = 'published',
+           published_at = CURRENT_TIMESTAMP,
+           instagram_media_id = ?,
+           last_error = NULL,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = ?`
+    ).bind(providerId, post.id).run();
+    await addEvent(env, post.id, "ayrshare_published", `Published through Ayrshare. Provider ID: ${providerId}`);
+  } catch (error) {
+    const message = errorToMessage(error);
+    await env.DB.prepare("UPDATE posts SET status = 'failed', last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(message, post.id).run();
+    await addEvent(env, post.id, "ayrshare_failed", message);
+  }
 }
 
 async function publishToWebhook(env: Env, post: PostRecord, publisher: ExternalPublisherRecord): Promise<void> {
