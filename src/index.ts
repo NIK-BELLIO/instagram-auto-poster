@@ -3,6 +3,10 @@ type Env = {
   MEDIA: KVNamespace;
   AUTH_SECRET: string;
   GRAPH_API_VERSION?: string;
+  INSTAGRAM_CLIENT_ID?: string;
+  INSTAGRAM_CLIENT_SECRET?: string;
+  INSTAGRAM_REDIRECT_URI?: string;
+  APP_URL?: string;
 };
 
 type PostStatus = "draft" | "scheduled" | "publishing" | "published" | "failed" | "cancelled";
@@ -142,6 +146,10 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     return json(await loginUser(env, payload));
   }
 
+  if (request.method === "GET" && path === "/api/instagram/oauth/callback") {
+    return await handleInstagramOAuthCallback(url, env);
+  }
+
   const auth = await authenticate(request, env);
   if (!auth) return json({ ok: false, error: "اول وارد حساب کاربری شو." }, 401);
 
@@ -171,6 +179,10 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
 
   if (request.method === "POST" && path === "/api/media/upload") {
     return json(await uploadMedia(request, env, auth), 201);
+  }
+
+  if (request.method === "GET" && path === "/api/instagram/oauth/start") {
+    return json({ ok: true, url: await buildInstagramOAuthUrl(env, auth.id) });
   }
 
   if (request.method === "POST" && path === "/api/instagram/connect") {
@@ -430,6 +442,91 @@ async function getUserStats(env: Env, userId: string): Promise<Record<string, un
       mediaUploadEnabled: true
     }
   };
+}
+
+async function buildInstagramOAuthUrl(env: Env, userId: string): Promise<string> {
+  const clientId = env.INSTAGRAM_CLIENT_ID?.trim();
+  const redirectUri = getInstagramRedirectUri(env);
+  if (!clientId || !env.INSTAGRAM_CLIENT_SECRET?.trim()) {
+    throw new HttpError("Instagram direct connect is not configured yet. The AI Radar owner must set INSTAGRAM_CLIENT_ID and INSTAGRAM_CLIENT_SECRET once.", 503);
+  }
+  const state = await createInstagramOAuthState(env, userId);
+  const oauth = new URL("https://www.instagram.com/oauth/authorize");
+  oauth.searchParams.set("client_id", clientId);
+  oauth.searchParams.set("redirect_uri", redirectUri);
+  oauth.searchParams.set("response_type", "code");
+  oauth.searchParams.set("scope", "instagram_business_basic,instagram_business_content_publish");
+  oauth.searchParams.set("state", state);
+  oauth.searchParams.set("force_authentication", "1");
+  return oauth.toString();
+}
+
+async function handleInstagramOAuthCallback(url: URL, env: Env): Promise<Response> {
+  const appUrl = env.APP_URL?.trim() || "https://airadar.me/auto-post/";
+  const redirect = new URL(appUrl);
+  const error = url.searchParams.get("error_description") || url.searchParams.get("error");
+  const code = url.searchParams.get("code");
+  const state = url.searchParams.get("state");
+  if (error || !code || !state) {
+    redirect.searchParams.set("instagram_error", error || "Instagram authorization was cancelled.");
+    return Response.redirect(redirect.toString(), 302);
+  }
+
+  try {
+    const statePayload = await verifyInstagramOAuthState(env, state);
+    const token = await exchangeInstagramCode(env, code);
+    const encrypted = await encryptSecret(env, token.accessToken);
+    await env.DB.prepare(
+      `INSERT INTO instagram_accounts (user_id, ig_user_id, access_token_cipher, access_token_iv, connected_at)
+       VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+       ON CONFLICT(user_id) DO UPDATE SET
+         ig_user_id = excluded.ig_user_id,
+         access_token_cipher = excluded.access_token_cipher,
+         access_token_iv = excluded.access_token_iv,
+         connected_at = CURRENT_TIMESTAMP`
+    ).bind(statePayload.userId, token.userId, encrypted.cipher, encrypted.iv).run();
+    await env.DB.prepare(
+      "UPDATE posts SET last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE user_id = ? AND status = 'scheduled' AND last_error LIKE 'Manual publishing mode:%'"
+    ).bind(statePayload.userId).run();
+    redirect.searchParams.set("instagram", "connected");
+  } catch (callbackError) {
+    redirect.searchParams.set("instagram_error", errorToMessage(callbackError));
+  }
+  return Response.redirect(redirect.toString(), 302);
+}
+
+function getInstagramRedirectUri(env: Env): string {
+  return env.INSTAGRAM_REDIRECT_URI?.trim() || "https://instagram-auto-poster.aliniashyn-9b4.workers.dev/api/instagram/oauth/callback";
+}
+
+async function exchangeInstagramCode(env: Env, code: string): Promise<{ accessToken: string; userId: string }> {
+  const clientId = env.INSTAGRAM_CLIENT_ID?.trim();
+  const clientSecret = env.INSTAGRAM_CLIENT_SECRET?.trim();
+  if (!clientId || !clientSecret) throw new HttpError("Instagram direct connect is not configured yet.", 503);
+
+  const body = new URLSearchParams();
+  body.set("client_id", clientId);
+  body.set("client_secret", clientSecret);
+  body.set("grant_type", "authorization_code");
+  body.set("redirect_uri", getInstagramRedirectUri(env));
+  body.set("code", code);
+
+  const response = await fetch("https://api.instagram.com/oauth/access_token", { method: "POST", body });
+  const payload = await safeJson(response);
+  if (!response.ok || typeof payload.access_token !== "string") {
+    throw new Error(extractGraphError(payload, "Instagram authorization failed."));
+  }
+
+  const shortToken = payload.access_token;
+  const userId = typeof payload.user_id === "number" || typeof payload.user_id === "string" ? String(payload.user_id) : "";
+  const longUrl = new URL("https://graph.instagram.com/access_token");
+  longUrl.searchParams.set("grant_type", "ig_exchange_token");
+  longUrl.searchParams.set("client_secret", clientSecret);
+  longUrl.searchParams.set("access_token", shortToken);
+  const longResponse = await fetch(longUrl.toString());
+  const longPayload = await safeJson(longResponse);
+  const accessToken = longResponse.ok && typeof longPayload.access_token === "string" ? longPayload.access_token : shortToken;
+  return { accessToken, userId: userId || "instagram-user" };
 }
 
 function normalizePath(pathname: string): string {
@@ -740,6 +837,40 @@ async function hashPassword(password: string, salt: string, pepper: string): Pro
 async function hashSessionToken(token: string, secret: string): Promise<string> {
   const bytes = new TextEncoder().encode(token + ":" + secret);
   return base64Url(new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)));
+}
+
+async function createInstagramOAuthState(env: Env, userId: string): Promise<string> {
+  const payload = base64Url(new TextEncoder().encode(JSON.stringify({
+    userId,
+    nonce: randomBase64Url(18),
+    exp: Date.now() + 10 * 60 * 1000
+  })));
+  const signature = await signState(env, payload);
+  return `${payload}.${signature}`;
+}
+
+async function verifyInstagramOAuthState(env: Env, state: string): Promise<{ userId: string }> {
+  const [payload, signature] = state.split(".");
+  if (!payload || !signature || !(await safeEqual(await signState(env, payload), signature))) {
+    throw new Error("Instagram connection state is invalid. Please try again.");
+  }
+  const parsed = JSON.parse(new TextDecoder().decode(fromBase64Url(payload))) as { userId?: string; exp?: number };
+  if (!parsed.userId || !parsed.exp || parsed.exp < Date.now()) {
+    throw new Error("Instagram connection expired. Please try again.");
+  }
+  return { userId: parsed.userId };
+}
+
+async function signState(env: Env, payload: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(env.AUTH_SECRET),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(`instagram-oauth:${payload}`));
+  return base64Url(new Uint8Array(signature));
 }
 
 async function encryptionKey(env: Env): Promise<CryptoKey> {
