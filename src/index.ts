@@ -31,6 +31,16 @@ type InstagramAccountRecord = {
   connected_at: string;
 };
 
+type ExternalPublisherRecord = {
+  user_id: string;
+  provider: "webhook";
+  webhook_url_cipher: string;
+  webhook_url_iv: string;
+  secret_cipher: string | null;
+  secret_iv: string | null;
+  connected_at: string;
+};
+
 type PostRecord = {
   id: string;
   user_id: string;
@@ -56,6 +66,11 @@ type AuthPayload = {
 type ConnectInstagramPayload = {
   igUserId?: unknown;
   accessToken?: unknown;
+};
+
+type ConnectPublisherPayload = {
+  webhookUrl?: unknown;
+  secret?: unknown;
 };
 
 type CreatePostPayload = {
@@ -137,11 +152,15 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
 
   if (request.method === "GET" && path === "/api/me") {
     const ig = await getInstagramAccount(env, auth.id);
+    const publisher = await getExternalPublisher(env, auth.id);
     return json({
       ok: true,
       user: publicUser(auth),
       instagram: ig
         ? { connected: true, igUserId: ig.ig_user_id, connectedAt: ig.connected_at }
+        : { connected: false },
+      publisher: publisher
+        ? { connected: true, provider: publisher.provider, connectedAt: publisher.connected_at }
         : { connected: false }
     });
   }
@@ -176,6 +195,37 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     ).bind(auth.id).run();
 
     return json({ ok: true, instagram: { connected: true, igUserId } });
+  }
+
+  if (request.method === "POST" && path === "/api/publisher/connect") {
+    const payload = await readJson<ConnectPublisherPayload>(request);
+    const webhookUrl = String(payload.webhookUrl ?? "").trim();
+    const secret = String(payload.secret ?? "").trim();
+    if (!isPublicUrl(webhookUrl) || !/^https:\/\//i.test(webhookUrl)) {
+      throw new HttpError("Webhook URL must be a public HTTPS URL.", 400);
+    }
+    const encryptedUrl = await encryptSecret(env, webhookUrl);
+    const encryptedSecret = secret ? await encryptSecret(env, secret) : null;
+    await env.DB.prepare(
+      `INSERT INTO external_publishers (user_id, provider, webhook_url_cipher, webhook_url_iv, secret_cipher, secret_iv, connected_at)
+       VALUES (?, 'webhook', ?, ?, ?, ?, CURRENT_TIMESTAMP)
+       ON CONFLICT(user_id) DO UPDATE SET
+         provider = 'webhook',
+         webhook_url_cipher = excluded.webhook_url_cipher,
+         webhook_url_iv = excluded.webhook_url_iv,
+         secret_cipher = excluded.secret_cipher,
+         secret_iv = excluded.secret_iv,
+         connected_at = CURRENT_TIMESTAMP`
+    ).bind(auth.id, encryptedUrl.cipher, encryptedUrl.iv, encryptedSecret?.cipher ?? null, encryptedSecret?.iv ?? null).run();
+    await env.DB.prepare(
+      "UPDATE posts SET last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE user_id = ? AND status = 'scheduled' AND last_error LIKE 'Manual publishing mode:%'"
+    ).bind(auth.id).run();
+    return json({ ok: true, publisher: { connected: true, provider: "webhook" } });
+  }
+
+  if (request.method === "DELETE" && path === "/api/publisher") {
+    await env.DB.prepare("DELETE FROM external_publishers WHERE user_id = ?").bind(auth.id).run();
+    return json({ ok: true, publisher: { connected: false } });
   }
 
   if (request.method === "GET" && path === "/api/posts") {
@@ -367,6 +417,7 @@ async function getUserStats(env: Env, userId: string): Promise<Record<string, un
   for (const row of grouped.results ?? []) counts[row.status] = Number(row.count) || 0;
   const total = Object.values(counts).reduce((sum, count) => sum + count, 0);
   const ig = await getInstagramAccount(env, userId);
+  const publisher = await getExternalPublisher(env, userId);
   return {
     ok: true,
     stats: {
@@ -374,7 +425,8 @@ async function getUserStats(env: Env, userId: string): Promise<Record<string, un
       scheduledPosts: counts.scheduled,
       publishedPosts: counts.published,
       failedPosts: counts.failed,
-      instagramConnected: Boolean(ig),
+      instagramConnected: Boolean(ig || publisher),
+      publisherConnected: Boolean(publisher),
       mediaUploadEnabled: true
     }
   };
@@ -480,6 +532,11 @@ async function publishPost(env: Env, postId: string): Promise<void> {
 
   const account = await getInstagramAccount(env, post.user_id);
   if (!account) {
+    const publisher = await getExternalPublisher(env, post.user_id);
+    if (publisher) {
+      await publishToWebhook(env, post, publisher);
+      return;
+    }
     const message = "Manual publishing mode: Meta connection is not active. Open Instagram, copy the caption, and use the uploaded media from AI Radar.";
     await env.DB.prepare(
       "UPDATE posts SET last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?"
@@ -558,6 +615,63 @@ async function publishToInstagram(
 
 async function getInstagramAccount(env: Env, userId: string): Promise<InstagramAccountRecord | null> {
   return await env.DB.prepare("SELECT * FROM instagram_accounts WHERE user_id = ?").bind(userId).first<InstagramAccountRecord>();
+}
+
+async function getExternalPublisher(env: Env, userId: string): Promise<ExternalPublisherRecord | null> {
+  return await env.DB.prepare("SELECT * FROM external_publishers WHERE user_id = ?").bind(userId).first<ExternalPublisherRecord>();
+}
+
+async function publishToWebhook(env: Env, post: PostRecord, publisher: ExternalPublisherRecord): Promise<void> {
+  await env.DB.prepare("UPDATE posts SET status = 'publishing', last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(post.id).run();
+  await addEvent(env, post.id, "webhook_publishing", "Sending post to external publishing webhook.");
+
+  try {
+    const webhookUrl = await decryptSecret(env, publisher.webhook_url_cipher, publisher.webhook_url_iv);
+    const secret = publisher.secret_cipher && publisher.secret_iv
+      ? await decryptSecret(env, publisher.secret_cipher, publisher.secret_iv)
+      : "";
+    const response = await fetch(webhookUrl, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...(secret ? { authorization: `Bearer ${secret}` } : {})
+      },
+      body: JSON.stringify({
+        source: "ai-radar",
+        postId: post.id,
+        caption: post.caption,
+        mediaUrl: post.media_url,
+        mediaType: post.media_type,
+        scheduledAt: post.scheduled_at,
+        createdAt: post.created_at
+      })
+    });
+    const body = await safeJson(response);
+    if (!response.ok) {
+      throw new Error(extractGraphError(body, `Publishing webhook failed with HTTP ${response.status}.`));
+    }
+    const providerId = typeof body.id === "string"
+      ? body.id
+      : typeof body.postId === "string"
+        ? body.postId
+        : `webhook:${Date.now()}`;
+    await env.DB.prepare(
+      `UPDATE posts
+       SET status = 'published',
+           published_at = CURRENT_TIMESTAMP,
+           instagram_media_id = ?,
+           last_error = NULL,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = ?`
+    ).bind(providerId, post.id).run();
+    await addEvent(env, post.id, "webhook_published", `Published through external webhook. Provider ID: ${providerId}`);
+  } catch (error) {
+    const message = errorToMessage(error);
+    await env.DB.prepare(
+      "UPDATE posts SET status = 'failed', last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?"
+    ).bind(message, post.id).run();
+    await addEvent(env, post.id, "webhook_failed", message);
+  }
 }
 
 async function getPost(env: Env, id: string, userId: string): Promise<PostRecord | null> {
