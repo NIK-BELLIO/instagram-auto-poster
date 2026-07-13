@@ -171,6 +171,9 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
          access_token_iv = excluded.access_token_iv,
          connected_at = CURRENT_TIMESTAMP`
     ).bind(auth.id, igUserId, encrypted.cipher, encrypted.iv).run();
+    await env.DB.prepare(
+      "UPDATE posts SET last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE user_id = ? AND status = 'scheduled' AND last_error LIKE 'Manual publishing mode:%'"
+    ).bind(auth.id).run();
 
     return json({ ok: true, instagram: { connected: true, igUserId } });
   }
@@ -209,6 +212,23 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     if (!post) return json({ ok: false, error: "پست پیدا نشد." }, 404);
     ctx.waitUntil(publishPost(env, post.id));
     return json({ ok: true, message: "انتشار شروع شد. چند لحظه بعد وضعیت را تازه‌سازی کن." });
+  }
+
+  const markPublishedMatch = path.match(/^\/api\/posts\/([^/]+)\/mark-published$/);
+  if (request.method === "POST" && markPublishedMatch) {
+    const id = markPublishedMatch[1];
+    const post = await getPost(env, id, auth.id);
+    if (!post) return json({ ok: false, error: "Post not found." }, 404);
+    await env.DB.prepare(
+      `UPDATE posts
+       SET status = 'published',
+           published_at = CURRENT_TIMESTAMP,
+           last_error = NULL,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = ? AND user_id = ?`
+    ).bind(id, auth.id).run();
+    await addEvent(env, id, "manual_published", "Marked as published by the user from assisted publishing mode.");
+    return json({ ok: true, post: await getPost(env, id, auth.id) });
   }
 
   const postMatch = path.match(/^\/api\/posts\/([^/]+)$/);
@@ -443,6 +463,7 @@ async function processDuePosts(env: Env): Promise<void> {
      WHERE status = 'scheduled'
        AND scheduled_at IS NOT NULL
        AND scheduled_at <= datetime('now')
+       AND (last_error IS NULL OR last_error NOT LIKE 'Manual publishing mode:%')
      ORDER BY scheduled_at ASC
      LIMIT 10`
   ).all<PostRecord>();
@@ -456,6 +477,16 @@ async function publishPost(env: Env, postId: string): Promise<void> {
   const post = await env.DB.prepare("SELECT * FROM posts WHERE id = ?").bind(postId).first<PostRecord>();
   if (!post) return;
   if (post.status === "publishing" || post.status === "published" || post.status === "cancelled") return;
+
+  const account = await getInstagramAccount(env, post.user_id);
+  if (!account) {
+    const message = "Manual publishing mode: Meta connection is not active. Open Instagram, copy the caption, and use the uploaded media from AI Radar.";
+    await env.DB.prepare(
+      "UPDATE posts SET last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?"
+    ).bind(message, post.id).run();
+    await addEvent(env, post.id, "manual_ready", message);
+    return;
+  }
 
   await env.DB.prepare("UPDATE posts SET status = 'publishing', last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(post.id).run();
   await addEvent(env, post.id, "publishing", "ارسال به Instagram Graph API شروع شد.");
