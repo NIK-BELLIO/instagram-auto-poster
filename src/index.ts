@@ -167,12 +167,14 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
   if (request.method === "GET" && path === "/api/me") {
     const ig = await getInstagramAccount(env, auth.id);
     const publisher = await getExternalPublisher(env, auth.id);
+    const instagramApp = await getInstagramAppConfig(env);
     return json({
       ok: true,
       user: publicUser(auth),
       instagram: ig
         ? { connected: true, igUserId: ig.ig_user_id, connectedAt: ig.connected_at }
         : { connected: false },
+      instagramDirect: { configured: Boolean(instagramApp.clientId && instagramApp.clientSecret) },
       publisher: publisher
         ? { connected: true, provider: publisher.provider, connectedAt: publisher.connected_at }
         : { connected: false }
