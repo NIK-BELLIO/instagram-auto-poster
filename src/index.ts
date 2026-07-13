@@ -174,7 +174,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       instagram: ig
         ? { connected: true, igUserId: ig.ig_user_id, connectedAt: ig.connected_at }
         : { connected: false },
-      instagramDirect: { configured: Boolean(instagramApp.clientId && instagramApp.clientSecret) },
+      instagramDirect: { configured: isUsableInstagramAppConfig(instagramApp) },
       publisher: publisher
         ? { connected: true, provider: publisher.provider, connectedAt: publisher.connected_at }
         : { connected: false }
@@ -464,7 +464,7 @@ async function getUserStats(env: Env, userId: string): Promise<Record<string, un
 
 async function buildInstagramOAuthUrl(env: Env, userId: string): Promise<string> {
   const config = await getInstagramAppConfig(env);
-  if (!config.clientId || !config.clientSecret) {
+  if (!isUsableInstagramAppConfig(config)) {
     throw new HttpError("Direct Instagram connection is not active yet. The site owner needs to finish one-time Instagram app setup.", 503);
   }
   const state = await createInstagramOAuthState(env, userId);
@@ -532,7 +532,7 @@ async function saveInstagramAppConfig(env: Env, payload: InstagramAppPayload): P
   const clientId = String(payload.clientId ?? "").trim();
   const clientSecret = String(payload.clientSecret ?? "").trim();
   const redirectUri = getInstagramRedirectUri(env);
-  if (!clientId || clientId.length < 4) throw new HttpError("Client ID is required.", 400);
+  if (!/^\d{6,}$/.test(clientId)) throw new HttpError("Instagram Client ID must be the numeric App ID from your Instagram/Meta app, not a username or app nickname.", 400);
   if (!clientSecret || clientSecret.length < 8) throw new HttpError("Client Secret is required.", 400);
   if (!/^https:\/\//i.test(redirectUri)) throw new HttpError("Redirect URI must be HTTPS.", 400);
   await Promise.all([
@@ -540,6 +540,10 @@ async function saveInstagramAppConfig(env: Env, payload: InstagramAppPayload): P
     setAppSetting(env, "INSTAGRAM_CLIENT_SECRET", clientSecret),
     setAppSetting(env, "INSTAGRAM_REDIRECT_URI", redirectUri)
   ]);
+}
+
+function isUsableInstagramAppConfig(config: { clientId: string; clientSecret: string }): boolean {
+  return /^\d{6,}$/.test(config.clientId) && config.clientSecret.length >= 8;
 }
 
 async function getAppSetting(env: Env, key: string): Promise<string> {
